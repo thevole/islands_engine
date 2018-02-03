@@ -1,5 +1,7 @@
 defmodule IslandsEngine.Game do
-  use GenServer
+  @timeout 60 * 60 * 24 * 1_000
+
+  use GenServer, start: {__MODULE__, :start_link, []}, restart: :transient
 
   alias IslandsEngine.{Board, Guesses, Rules, Coordinate, Island}
 
@@ -26,10 +28,16 @@ defmodule IslandsEngine.Game do
   end
 
   def init(name) do
-    player1 = %{name: name, board: Board.new(), guesses: Guesses.new()}
-    player2 = %{name: nil, board: Board.new(), guesses: Guesses.new()}
-    {:ok, %{player1: player1, player2: player2, rules: %Rules{}}}
+    send(self(), {:set_state, name})
+    {:ok, fresh_state(name)}
   end
+
+  def terminate({:shutdown, :timeout}, state_data) do
+    :ets.delete(:game_state, state_data.player1.name)
+    :ok
+  end
+
+  def terminate(_reason, _state), do: :ok
 
   def handle_call({:add_player, name}, _from, state_data) do
     with {:ok, rules} <- Rules.check(state_data.rules, :add_player) do
@@ -38,7 +46,7 @@ defmodule IslandsEngine.Game do
       |> update_rules(rules)
       |> reply_success(:ok)
     else
-      :error -> {:reply, :error, state_data}
+      :error -> {:reply, :error, state_data, @timeout}
     end
   end
 
@@ -55,7 +63,7 @@ defmodule IslandsEngine.Game do
       |> reply_success(:ok)
     else
       :error ->
-        {:reply, :error, state_data}
+        {:reply, :error, state_data, @timeout}
 
       {:error, :invalid_coordinate} ->
         {:reply, {:error, :invalid_coordinate}, state_data}
@@ -74,8 +82,8 @@ defmodule IslandsEngine.Game do
       |> update_rules(rules)
       |> reply_success({:ok, board})
     else
-      :error -> {:reply, :error, state_data}
-      false -> {:reply, {:error, :not_all_islands_positioned}, state_data}
+      :error -> {:reply, :error, state_data, @timeout}
+      false -> {:reply, {:error, :not_all_islands_positioned}, state_data, @timeout}
     end
   end
 
@@ -88,7 +96,6 @@ defmodule IslandsEngine.Game do
          {hit_or_miss, forested_island, win_status, opponent_board} <-
            Board.guess(opponent_board, coordinate),
          {:ok, rules} <- Rules.check(rules, {:win_check, win_status}) do
-
       state_data
       |> update_board(opponent_key, opponent_board)
       |> update_guesses(player_key, hit_or_miss, coordinate)
@@ -96,11 +103,26 @@ defmodule IslandsEngine.Game do
       |> reply_success({hit_or_miss, forested_island, win_status})
     else
       :error ->
-        {:reply, :error, state_data}
+        {:reply, :error, state_data, @timeout}
 
       {:error, :invalid_coordinate} ->
-        {:reply, {:error, :invalid_coordinate}, state_data}
+        {:reply, {:error, :invalid_coordinate}, state_data, @timeout}
     end
+  end
+
+  def handle_info({:set_state, name}, _state_data) do
+    state_data =
+      case :ets.lookup(:game_state, name) do
+        [] -> fresh_state(name)
+        [{_key, state}] -> state
+      end
+
+    :ets.insert(:game_state, {name, state_data})
+    {:noreply, state_data, @timeout}
+  end
+
+  def handle_info(:timeout, state_data) do
+    {:stop, {:shutdown, :timeout}, state_data}
   end
 
   defp update_board(state_data, player, board) do
@@ -118,7 +140,8 @@ defmodule IslandsEngine.Game do
   end
 
   defp reply_success(state_data, reply) do
-    {:reply, reply, state_data}
+    :ets.insert(:game_state, {state_data.player1.name, state_data})
+    {:reply, reply, state_data, @timeout}
   end
 
   defp player_board(state_data, player) do
@@ -135,4 +158,10 @@ defmodule IslandsEngine.Game do
   end
 
   def via_tuple(name), do: {:via, Registry, {Registry.Game, name}}
+
+  defp fresh_state(name) do
+    player1 = %{name: name, board: Board.new(), guesses: Guesses.new()}
+    player2 = %{name: nil, board: Board.new(), guesses: Guesses.new()}
+    %{player1: player1, player2: player2, rules: %Rules{}}
+  end
 end
